@@ -1,0 +1,23 @@
+[profile.default]
+src = "contracts"
+test = "test"
+script = "script"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.24"
+optimizer = true
+optimizer_runs = 200
+via_ir = false
+verbosity = 3
+
+# Deterministic fuzzing baseline; the CI profile cranks it up.
+fuzz = { runs = 512 }
+
+remappings = [
+  "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+  "forge-std/=lib/forge-std/src/"
+]
+
+[profile.ci]
+fuzz = { runs = 5000 }
+verbosity = 4

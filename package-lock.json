@@ -1,0 +1,12 @@
+{
+  "name": "enterprise-dao-ecosystem",
+  "version": "2.0.1",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "enterprise-dao-ecosystem",
+      "version": "2.0.1"
+    }
+  }
+}

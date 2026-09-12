@@ -21,3 +21,9 @@ remappings = [
 [profile.ci]
 fuzz = { runs = 5000 }
 verbosity = 4
+invariant = { runs = 256, depth = 64 }
+
+# Fast local invariant smoke profile.
+[profile.invariant-smoke]
+test = "test"
+invariant = { runs = 32, depth = 32 }

@@ -80,6 +80,12 @@ forge build
 forge test
 ```
 
+Prefer Docker? The pinned toolchain image reproduces CI exactly:
+
+```bash
+docker compose up --build
+```
+
 ## Deploy
 
 ```bash

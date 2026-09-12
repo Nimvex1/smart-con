@@ -1,0 +1,7 @@
+services:
+  dao:
+    build: .
+    volumes:
+      - ./cache:/app/cache
+      - ./out:/app/out
+    command: forge test --match-path 'test/*.t.sol' --no-match-path 'test/*Invariant*.t.sol'

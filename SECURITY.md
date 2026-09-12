@@ -103,7 +103,6 @@ zero custody, all powers reviewed above are tested in `TreasuryFuzz.t.sol` and
   to bound the blast radius even under full capture.
 
 ### 4. Treasury tier configuration
-
 - Only GOVERNANCE_ROLE (the timelock). Delays bounded to `MIN_TIER_DELAY = 1 hour`
   .. `MAX_TIER_DELAY = 365 days`; value caps are arbitrary but set at construction.
 - **Execution-time revalidation:** allowlist membership, tier enabled-state and value
@@ -122,6 +121,16 @@ zero custody, all powers reviewed above are tested in `TreasuryFuzz.t.sol` and
   attacker contract that calls the token) are contained by the allowlist and
   off-chain monitoring.
 - **Package expiry** is capped at `MAX_PACKAGE_EXPIRY = 365 days` from scheduling.
+
+### 5. Vesting vault
+
+- Schedules are created only by GOVERNANCE_ROLE (the timelock) and funded with an
+  allowance-based pull, so no schedule exists without a passed proposal.
+- Claims are permissionless but can only pay the recorded beneficiary; revocation
+  returns only the unvested remainder to a governance-chosen address while vested
+  tokens stay claimable. Vesting freezes at the revocation timestamp.
+- The vault holds no roles on the treasury and cannot move treasury funds — it only
+  escrows what governance explicitly funds it with.
 
 ## Package lifecycle guarantees
 

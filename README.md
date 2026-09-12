@@ -13,6 +13,7 @@ quorum governor**, a **multi-tier quarantined treasury execution engine** with
 | `contracts/EnterpriseDAO.sol` | GovernorSettings + GovernorCountingSimple + GovernorVotes + GovernorTimelockControl with block-based settings, bounded variable proposal threshold, deployment-floored voting delay/period (governance may lengthen, never shorten), and a snapshot-safe **linear dynamic quorum**. Constructor takes a single `GovernorConfig` struct (stack-safe without `via_ir`). |
 | `contracts/DAOTreasuryExecutionEngine.sol` | Multi-tier quarantine execution engine, governance-only scheduling (single + batch), **time-bound** guardian emergency cancellation/pause, permissionless post-delay execution (single + batch), ETH/ERC20/ERC721/ERC1155 custody, native-value caps, delay bounds (1h–365d), **package expiry cap**, **execution-time policy revalidation**, **global spend rate limiter**, **direct-target ERC20 floors**, **predecessor dependencies** (+ governance unbrick), **destination allowlist** (self-brick guarded), **native reserve floor**, package hashing with retained `dataHash`, and `packageState`/batch getters. |
 | `contracts/DAODeploymentNotes.sol` | Secure bootstrap and role hand-off sequence (checklist form). |
+| `contracts/VestingVault.sol` | Cliff + linear vesting for contributor payouts: governance-created, allowance-funded, permissionless claims to the beneficiary, revocable unvested remainder. |
 | `script/Deploy.s.sol` | Executable bootstrap deployment following the notes. |
 | `test/*.t.sol` | Foundry test suites: unit, fuzz, invariant, malicious-token and governance-attack coverage (~90 tests). |
 | `foundry.toml` | Solidity 0.8.24 Foundry configuration (default + CI fuzz profiles). |
@@ -69,24 +70,14 @@ above inside Ubuntu and `cd /mnt/c/Users/<you>/...` into the project folder.
 
 ### Step 1 — Build & test
 
-Dependencies are vendored under `lib/` (OpenZeppelin Contracts v5.1.0, forge-std v1.9.7,
-no `.git`, no submodules), so the project builds out of the box — no `git`, no
-`forge install`, no network needed for dependencies (only the solc 0.8.24 download on
-first run):
+Dependencies are pinned git submodules (OpenZeppelin Contracts v5.1.0,
+forge-std v1.9.7), so clone recursively — no `forge install`, no network needed
+beyond the submodules (only the solc 0.8.24 download on first run):
 
 ```bash
+git clone --recurse-submodules <url>
 forge build
 forge test
-```
-
-Prefer submodules instead of vendoring?
-
-```bash
-rm -rf lib/openzeppelin-contracts lib/forge-std
-git submodule add https://github.com/OpenZeppelin/openzeppelin-contracts lib/openzeppelin-contracts
-git submodule add https://github.com/foundry-rs/forge-std lib/forge-std
-git -C lib/openzeppelin-contracts checkout v5.1.0
-git -C lib/forge-std checkout v1.9.7
 ```
 
 ## Deploy
@@ -246,7 +237,7 @@ forge snapshot                      # gas snapshot (checked in CI)
 forge fmt --check                   # formatting (checked in CI)
 ```
 
-The suite (~96 tests across 10 files) covers:
+The suite (~106 tests across 11 files) covers:
 
 - **Unit** — token permits/checkpoints/burns; proposal lifecycle, snapshot safety,
   dynamic quorum regimes and boundary math, constructor validation, threshold
@@ -276,6 +267,10 @@ The suite (~96 tests across 10 files) covers:
   safety against post-snapshot acquisitions, flash-loan-style zero-weight votes,
   delegation flips around snapshots, quorum manipulation via burns before/after
   snapshots, proposer-threshold edge cases.
+- **Vesting** (`VestingVault.t.sol`) — full/partial claims, cliff gating, revocation
+  refunds with frozen vesting, irrevocable/double-revoke guards, access control.
+- **Deploy script** (`DeployScript.t.sol`) — runs `Deploy.s.sol` end-to-end in-process
+  plus an independent topology replica (script line coverage 100%).
 
 ## Security
 

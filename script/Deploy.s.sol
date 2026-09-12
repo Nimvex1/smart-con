@@ -18,6 +18,8 @@ import {DAOTreasuryExecutionEngine} from "../contracts/DAOTreasuryExecutionEngin
 ///         Required environment variables:
 ///         - INITIAL_RECIPIENT   address receiving the full initial token supply (multisig)
 ///         - GUARDIAN_ADDRESS   emergency guardian (recommend an audited multisig)
+///         - DEPLOYER_ADMIN     temporary timelock admin (defaults to the broadcaster;
+///           set to a multisig to skip the manual admin hand-off)
 ///
 ///         Optional environment variables (defaults shown):
 ///         - TOKEN_NAME            "Enterprise DAO Token"
@@ -181,7 +183,10 @@ contract Deploy is Script {
         address[] memory noProposers = new address[](0);
         address[] memory openExecutors = new address[](1);
         openExecutors[0] = address(0); // EXECUTOR_ROLE open to anyone
-        timelock = new TimelockController(minDelay, noProposers, openExecutors, msg.sender);
+        // Explicit admin override (e.g. a multisig); otherwise the broadcaster
+        // holds temporary admin until the manual renounce step.
+        address admin = vm.envOr("DEPLOYER_ADMIN", msg.sender);
+        timelock = new TimelockController(minDelay, noProposers, openExecutors, admin);
         console2.log("TimelockController:", address(timelock));
     }
 

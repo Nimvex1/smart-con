@@ -7,6 +7,7 @@ import {IVotes} from "@openzeppelin/contracts/governance/utils/IVotes.sol";
 import {DAOGovernanceToken} from "../contracts/DAOGovernanceToken.sol";
 import {EnterpriseDAO} from "../contracts/EnterpriseDAO.sol";
 import {DAOTreasuryExecutionEngine} from "../contracts/DAOTreasuryExecutionEngine.sol";
+import {Deploy} from "../script/Deploy.s.sol";
 
 /// @dev Runs the deployment script against a fresh in-process chain and verifies
 ///      every post-deployment assertion passes with canonical parameters, plus the
@@ -15,6 +16,11 @@ contract DeployScriptTest is Test {
     address internal deployer = makeAddr("deployer");
     address internal multisig = makeAddr("multisig");
     address internal guardian = makeAddr("guardian");
+
+    /// @dev Forge's default broadcast sender (used by `vm.startBroadcast()` with no
+    ///      key). Pranking it aligns the script's internal `msg.sender` (timelock
+    ///      admin) with the broadcast sender (role granter) in-process.
+    address internal constant SCRIPT_SENDER = 0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38;
 
     function test_DeployScriptWiring() public {
         // The script itself now performs assertions in _assertWiring; this test
@@ -40,6 +46,19 @@ contract DeployScriptTest is Test {
         assertEq(governor.timelock(), address(timelock));
         assertEq(governor.dynamicQuorumMinBps(), 400);
         assertEq(governor.dynamicQuorumMaxBps(), 1000);
+    }
+
+    function test_DeployScriptRunsEndToEnd() public {
+        // Exercise the real bootstrap path, including its post-deployment
+        // assertions: a regression in Deploy.s.sol fails CI here.
+        vm.setEnv("INITIAL_RECIPIENT", vm.toString(multisig));
+        vm.setEnv("GUARDIAN_ADDRESS", vm.toString(guardian));
+        // In-process, `msg.sender` (timelock admin) and the broadcast sender
+        // (role granter) diverge; pinning the admin to the broadcast sender
+        // reproduces the production topology exactly.
+        vm.setEnv("DEPLOYER_ADMIN", vm.toString(SCRIPT_SENDER));
+        Deploy deploy = new Deploy();
+        deploy.run();
     }
 
     function _deployLikeScript()

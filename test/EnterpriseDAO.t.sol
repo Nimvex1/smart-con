@@ -372,7 +372,8 @@ contract EnterpriseDAOTest is Test {
     function test_FullGovernanceToTreasuryFlow() public {
         bytes memory innerCalldata = abi.encodeCall(CallTarget.setFlag, (uint256(7)));
         bytes memory treasuryCall = abi.encodeCall(
-            DAOTreasuryExecutionEngine.approvePackage, (address(target), uint256(0), innerCalldata, treasury.TIER_LOW())
+            DAOTreasuryExecutionEngine.approvePackage,
+            (address(target), uint256(0), innerCalldata, treasury.TIER_LOW(), uint48(0), bytes32(0))
         );
 
         uint256 proposalId = _propose(governor, address(treasury), treasuryCall, "schedule treasury package");

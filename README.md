@@ -2,7 +2,7 @@
 
 Modular DAO architecture built around OpenZeppelin Contracts 5.x, with a **linear dynamic
 quorum governor**, a **multi-tier quarantined treasury execution engine** with
-**time-bound guardian powers**, a **full Foundry test suite** (43 tests) and a
+**time-bound guardian powers**, a **full Foundry test suite** (~90 tests) and a
 **bootstrap deployment script**.
 
 ## Files
@@ -11,10 +11,10 @@ quorum governor**, a **multi-tier quarantined treasury execution engine** with
 | --- | --- |
 | `contracts/DAOGovernanceToken.sol` | ERC20 + ERC20Permit + ERC20Votes + ERC20Burnable with historical checkpoints and compiler-safe overrides. Fixed supply, minted once at construction. |
 | `contracts/EnterpriseDAO.sol` | GovernorSettings + GovernorCountingSimple + GovernorVotes + GovernorTimelockControl with block-based settings, bounded variable proposal threshold, and a snapshot-safe **linear dynamic quorum**. Constructor takes a single `GovernorConfig` struct (stack-safe without `via_ir`). |
-| `contracts/DAOTreasuryExecutionEngine.sol` | Multi-tier quarantine execution engine, governance-only scheduling, **time-bound** guardian emergency cancellation/pause, permissionless post-delay execution (single + batch), ETH/ERC20/ERC721/ERC1155 custody, native-value caps, delay upper bound, and package hashing. |
+| `contracts/DAOTreasuryExecutionEngine.sol` | Multi-tier quarantine execution engine, governance-only scheduling, **time-bound** guardian emergency cancellation/pause, permissionless post-delay execution (single + batch), ETH/ERC20/ERC721/ERC1155 custody, native-value caps, delay upper bound, **package expiry**, **predecessor dependencies**, **destination allowlist**, **native reserve floor**, and package hashing. |
 | `contracts/DAODeploymentNotes.sol` | Secure bootstrap and role hand-off sequence (checklist form). |
 | `script/Deploy.s.sol` | Executable bootstrap deployment following the notes. |
-| `test/*.t.sol` | Foundry test suite: 43 tests across token, governor and treasury. |
+| `test/*.t.sol` | Foundry test suites: unit, fuzz, invariant, malicious-token and governance-attack coverage (~90 tests). |
 | `foundry.toml` | Solidity 0.8.24 Foundry configuration (default + CI fuzz profiles). |
 | `package.json` | Project metadata and convenience scripts. |
 | `setup-foundry.ps1` | One-shot Windows installer for Foundry v1.8.1: downloads the official zip, verifies its SHA-256, extracts `forge`/`cast`/`anvil`/`chisel`/`solar` to `%USERPROFILE%\foundry`, and adds it to the user PATH. |
@@ -142,7 +142,7 @@ Hardening added in v2:
 - **Tier delay upper bound** (`MAX_TIER_DELAY = 365 days`) — prevents `uint48`
   truncation abuse and nonsensical multi-year quarantines.
 - **Storage packing** — `executeAfter`, `tier`, `executed`, `cancelled` share one slot.
-- **43-test Foundry suite** and a bootstrap deployment script.
+- **~90-test Foundry suite** (unit, fuzz, invariant, malicious-token, governance-attack) and a bootstrap deployment script.
 
 ## Security architecture
 
@@ -226,17 +226,50 @@ system.
 ## Testing
 
 ```bash
-forge test              # default profile
-forge test --profile ci # higher fuzz budget
-forge snapshot          # gas snapshot
+forge test                          # default profile (unit + fuzz + invariants)
+forge test --profile ci             # 5000-run fuzz + deep invariant suite
+forge test --profile invariant-smoke # fast local invariant check
+forge snapshot                      # gas snapshot (checked in CI)
+forge fmt --check                   # formatting (checked in CI)
 ```
 
-The suite covers: token permits/checkpoints/burns; proposal lifecycle, snapshot
-safety, dynamic quorum regimes and boundary math, constructor validation, threshold
-bounds via real proposals, timelock delay enforcement; treasury deposits, tier
-mechanics, value caps, pause/unpause split, time-bound guardian cancellation, batch
-execution, failure propagation and rollback, and the full
-governor→timelock→treasury integration.
+The suite (~90 tests across 9 files) covers:
+
+- **Unit** — token permits/checkpoints/burns; proposal lifecycle, snapshot safety,
+  dynamic quorum regimes and boundary math, constructor validation, threshold
+  bounds via real proposals, timelock delay enforcement; treasury deposits, tier
+  mechanics, value caps, pause/unpause split, time-bound guardian cancellation,
+  batch execution, failure propagation and rollback, and the full
+  governor→timelock→treasury integration.
+- **Fuzz** (`TreasuryFuzz.t.sol`, `QuorumFuzzTest`) — package-id commitment,
+  tier/delay/cap boundaries, guardian cancellation timing, expiry windows,
+  predecessor ordering, destination allowlist, native reserve floors,
+  unauthorized-scheduling ACL; quorum fraction monotonicity, clamping, exact
+  linear interpolation, degenerate ramp safety.
+- **Invariants** (`TreasuryInvariant.t.sol`) — handler-driven state machine:
+  executed packages can never execute again; cancelled packages can never
+  execute; executed/cancelled are mutually exclusive; unauthorized accounts can
+  never schedule packages.
+- **Malicious tokens** (`MaliciousToken.t.sol`) — reentrant ERC20 deposits,
+  malformed return data, false-return tokens, always-reverting tokens,
+  gas-guzzler targets, and reentrancy across `executePackage` (blocked by
+  `nonReentrant`).
+- **Governance attacks** (`GovernanceAttack.t.sol`) — exact 50% ties, snapshot
+  safety against post-snapshot acquisitions, flash-loan-style zero-weight votes,
+  delegation flips around snapshots, quorum manipulation via burns before/after
+  snapshots, proposer-threshold edge cases.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for the formal threat model: who can move funds
+under which conditions, what the guardian can and cannot do, and compromise
+analysis for every privileged component.
+
+## Static analysis
+
+CI runs `forge build`, unit tests, `forge fmt --check`, gas snapshot check,
+a 5000-run fuzz + invariant job, and Slither (SARIF uploaded to GitHub
+Security tab). Slither is filtered to project contracts (`lib/` excluded).
 
 ## Important audit note
 

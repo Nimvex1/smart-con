@@ -96,16 +96,18 @@ contract DAOTreasuryExecutionEngineTest is Test {
         (uint48 tierDelay,,) = treasury.tierConfig(tier);
         executeAfter = uint48(block.timestamp + tierDelay);
         vm.expectEmit(true, true, true, true, address(treasury));
-        emit DAOTreasuryExecutionEngine.PackageApproved(
+        emit DAOTreasuryExecutionEngine.PackageApprovedV2(
             packageIdFor(target_, value, data, tier),
             target_,
             value,
             tier,
             treasury.nextPackageNonce(),
             executeAfter,
+            uint48(0),
+            bytes32(0),
             keccak256(data)
         );
-        packageId = treasury.approvePackage(target_, value, data, tier);
+        packageId = treasury.approvePackage(target_, value, data, tier, 0, bytes32(0));
     }
 
     function packageIdFor(address target_, uint256 value, bytes memory data, uint8 tier)
@@ -225,21 +227,21 @@ contract DAOTreasuryExecutionEngineTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(DAOTreasuryExecutionEngine.NativeValueTooHigh.selector, 251 ether, 250 ether)
         );
-        treasury.approvePackage(address(target), 251 ether, "", TIER_LOW);
+        treasury.approvePackage(address(target), 251 ether, "", TIER_LOW, 0, bytes32(0));
 
         vm.expectRevert(
             abi.encodeWithSelector(DAOTreasuryExecutionEngine.NativeValueTooHigh.selector, 6 ether, 5 ether)
         );
-        treasury.approvePackage(address(target), 6 ether, "", TIER_CRITICAL);
+        treasury.approvePackage(address(target), 6 ether, "", TIER_CRITICAL, 0, bytes32(0));
     }
 
     function test_ApproveRejectsInvalidTierAndDisabledTier() public {
         vm.expectRevert(abi.encodeWithSelector(DAOTreasuryExecutionEngine.InvalidTier.selector, 4));
-        treasury.approvePackage(address(target), 0, "", 4);
+        treasury.approvePackage(address(target), 0, "", 4, 0, bytes32(0));
 
         treasury.configureTier(TIER_HIGH, 7 days, 25 ether, false);
         vm.expectRevert(abi.encodeWithSelector(DAOTreasuryExecutionEngine.TierDisabled.selector, TIER_HIGH));
-        treasury.approvePackage(address(target), 0, "", TIER_HIGH);
+        treasury.approvePackage(address(target), 0, "", TIER_HIGH, 0, bytes32(0));
     }
 
     function test_ExecuteForwardsNativeValue() public {
@@ -367,7 +369,7 @@ contract DAOTreasuryExecutionEngineTest is Test {
             )
         );
         vm.prank(rando);
-        treasury.approvePackage(address(target), 0, "", TIER_LOW);
+        treasury.approvePackage(address(target), 0, "", TIER_LOW, 0, bytes32(0));
     }
 
     function test_PauseBlocksExecutionAndDeposits() public {
@@ -427,7 +429,7 @@ contract DAOTreasuryExecutionEngineTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(DAOTreasuryExecutionEngine.NativeValueTooHigh.selector, 11 ether, 10 ether)
         );
-        treasury.approvePackage(address(target), 11 ether, "", TIER_LOW);
+        treasury.approvePackage(address(target), 11 ether, "", TIER_LOW, 0, bytes32(0));
     }
 
     function test_TierDelayUpperBound() public {

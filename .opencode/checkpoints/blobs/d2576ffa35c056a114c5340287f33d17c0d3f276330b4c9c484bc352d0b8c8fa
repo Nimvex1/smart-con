@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  FOUNDRY_PROFILE: default
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.1
+
+      - name: Show Forge version
+        run: forge --version
+
+      - name: Build
+        run: forge build
+
+      - name: Unit tests
+        run: forge test --match-path 'test/*.t.sol' --no-match-path 'test/*Invariant*.t.sol'
+
+      - name: Formatting check
+        run: forge fmt --check
+
+      - name: Gas snapshot check
+        # 1% tolerance absorbs cross-platform gas variance between local and CI
+        # Foundry builds; real regressions are orders of magnitude larger.
+        run: forge snapshot --check --tolerance 1 --no-match-test "testFuzz_|invariant_"
+
+  fuzz-and-invariants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.1
+
+      - name: High-run fuzz + invariant suite
+        run: forge test --profile ci
+
+  slither:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.1
+
+      - name: Slither analysis
+        uses: crytic/slither-action@v0.4.0
+        id: slither
+        with:
+          target: .
+          fail-on: none
+          sarif: slither.sarif
+          slither-args: --filter-paths lib
+
+      - name: Upload SARIF (optional)
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: ${{ steps.slither.outputs.sarif }}

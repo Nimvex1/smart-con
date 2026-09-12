@@ -14,6 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
@@ -37,10 +39,21 @@ jobs:
         # Foundry builds; real regressions are orders of magnitude larger.
         run: forge snapshot --check --tolerance 1 --no-match-test "testFuzz_|invariant_"
 
+      - name: Coverage (lcov artifact for verifiability)
+        run: forge coverage --report lcov --no-match-test "testFuzz_|invariant_"
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+
   fuzz-and-invariants:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
@@ -57,6 +70,8 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1

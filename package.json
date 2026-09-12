@@ -1,0 +1,14 @@
+{
+  "name": "enterprise-dao-ecosystem",
+  "private": true,
+  "version": "2.0.1",
+  "description": "Modular DAO governance and multi-tier treasury execution engine for Solidity 0.8.24 / OpenZeppelin 5.x, with a full Foundry test suite and bootstrap deployment script",
+  "scripts": {
+    "build": "forge build",
+    "test": "forge test",
+    "test:ci": "forge test --profile ci",
+    "format": "forge fmt",
+    "snapshot": "forge snapshot",
+    "deploy": "forge script script/Deploy.s.sol --broadcast --verify"
+  }
+}

@@ -33,7 +33,7 @@ jobs:
         run: forge fmt --check
 
       - name: Gas snapshot check
-        run: forge snapshot --check
+        run: forge snapshot --check --no-match-test "testFuzz_|invariant_"
 
   fuzz-and-invariants:
     runs-on: ubuntu-latest

@@ -89,9 +89,70 @@ contract Deploy is Script {
         vm.stopBroadcast();
 
         // ------------------------------------------------------------------
+        // Post-deployment assertions: the deployment FAILS LOUDLY if any
+        // wiring assumption is broken, rather than shipping a misconfigured DAO.
+        // ------------------------------------------------------------------
+        _assertWiring(token, timelock, treasury, governor, params);
+    }
+
+    function _assertWiring(
+        DAOGovernanceToken token,
+        TimelockController timelock,
+        DAOTreasuryExecutionEngine treasury,
+        EnterpriseDAO governor,
+        DeployParams memory params
+    ) internal view {
+        // --- Timelock <-> Governor wiring -------------------------------------
+        bytes32 proposerRole = timelock.PROPOSER_ROLE();
+        bytes32 cancellerRole = timelock.CANCELLER_ROLE();
+        bytes32 executorRole = timelock.EXECUTOR_ROLE();
+        require(timelock.hasRole(proposerRole, address(governor)), "governor missing PROPOSER_ROLE");
+        require(timelock.hasRole(cancellerRole, address(governor)), "governor missing CANCELLER_ROLE");
+        require(timelock.hasRole(executorRole, address(0)), "executor role not open");
+        require(timelock.getMinDelay() == params.timelockMinDelay, "timelock delay mismatch");
+
+        // --- Treasury <-> Timelock/Guardian ----------------------------------
+        require(treasury.hasRole(treasury.GOVERNANCE_ROLE(), address(timelock)), "timelock not treasury governance");
+        require(treasury.hasRole(treasury.GUARDIAN_ROLE(), params.guardian), "guardian not set on treasury");
+        require(
+            !treasury.hasRole(treasury.GOVERNANCE_ROLE(), address(governor)),
+            "governor must reach treasury only via the timelock"
+        );
+
+        // --- Governor parameters ---------------------------------------------
+        require(governor.votingDelay() == params.votingDelay, "voting delay mismatch");
+        require(governor.votingPeriod() == params.votingPeriod, "voting period mismatch");
+        require(governor.proposalThreshold() == params.proposalThreshold, "proposal threshold mismatch");
+        require(governor.timelock() == address(timelock), "governor wired to wrong timelock");
+        require(address(governor.token()) == address(token), "governor wired to wrong token");
+
+        // --- Quorum ramp --------------------------------------------------------
+        require(governor.dynamicQuorumMinBps() == params.quorumMinBps, "quorum min mismatch");
+        require(governor.dynamicQuorumMaxBps() == params.quorumMaxBps, "quorum max mismatch");
+        require(
+            governor.quorumLowSupplyThreshold() == params.initialSupply / 4,
+            "quorum low threshold mismatch (expected initialSupply/4)"
+        );
+        require(
+            governor.quorumHighSupplyThreshold() == (params.initialSupply * 9) / 10,
+            "quorum high threshold mismatch (expected initialSupply*9/10)"
+        );
+
+        // --- Token ---------------------------------------------------------------
+        require(token.totalSupply() == params.initialSupply, "token supply mismatch");
+        require(token.balanceOf(params.initialRecipient) == params.initialSupply, "bootstrap supply not delivered");
+
+        // --- Treasury tiers ---------------------------------------------------
+        (uint48 lowDelay, uint256 lowCap, bool lowEnabled) = treasury.tierConfig(treasury.TIER_LOW());
+        require(lowEnabled, "TIER_LOW disabled");
+        require(lowDelay == 1 days, "TIER_LOW delay mismatch");
+        require(lowCap == 250 ether, "TIER_LOW cap mismatch");
+
+        // ------------------------------------------------------------------
         // Post-deployment report
         // ------------------------------------------------------------------
         console2.log("--------------------------------------------------------");
+        console2.log("All post-deployment wiring assertions passed.");
         console2.log("Bootstrap complete. Verify, then renounce the deployer");
         console2.log("admin role on the timelock:");
         console2.log("  cast send", address(timelock));

@@ -37,6 +37,11 @@ contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard,
     ///         nonsensical for this system and would risk `uint48` truncation abuse.
     uint48 public constant MAX_TIER_DELAY = 365 days;
 
+    /// @notice Maximum scheduling horizon: a package must be executable (executeAfter
+    ///         must be within this window after approval) so governance cannot park a
+    ///         package for a decade ahead.
+    uint48 public constant MAX_PACKAGE_EXPIRY = 365 days;
+
     struct TierConfig {
         uint48 delay;
         uint256 maxNativeValue;
@@ -45,6 +50,9 @@ contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard,
 
     /// @dev Field order packs `executeAfter`, `tier`, `executed` and `cancelled` into one
     ///      storage slot. `data` is wiped after execution to refund gas and keep state lean.
+    ///      `expiresAt` bounds the execution window: expired packages can never execute.
+    ///      `predecessor` enforces ordering: a package can only execute once its
+    ///      predecessor has executed.
     struct Package {
         address target;
         uint256 value;
@@ -54,11 +62,24 @@ contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard,
         bool executed;
         bool cancelled;
         uint256 nonce;
+        uint48 expiresAt;
+        bytes32 predecessor;
     }
 
     mapping(uint8 tier => TierConfig config) public tierConfig;
     mapping(bytes32 packageId => Package package_) private _packages;
     uint256 public nextPackageNonce = 1;
+
+    /// @notice Optional destination allowlist. When enabled, packages may only target
+    ///         allowlisted addresses. Toggle and list are governance-controlled.
+    bool public targetAllowlistEnabled;
+    mapping(address allowed => bool isAllowed) public targetAllowlist;
+
+    /// @notice Optional per-asset reserve floors: the treasury refuses to execute a
+    ///         package that would push its native or ERC20 balance below the floor.
+    ///         ERC20 floors of 0 disable the check for that token.
+    uint256 public nativeReserveFloor;
+    mapping(IERC20 token => uint256 floor) public erc20ReserveFloors;
 
     event PackageApproved(
         bytes32 indexed packageId,
@@ -69,30 +90,52 @@ contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard,
         uint48 executeAfter,
         bytes32 dataHash
     );
+    event PackageApprovedV2(
+        bytes32 indexed packageId,
+        address indexed target,
+        uint256 value,
+        uint8 indexed tier,
+        uint256 nonce,
+        uint48 executeAfter,
+        uint48 expiresAt,
+        bytes32 predecessor,
+        bytes32 dataHash
+    );
     event PackageExecuted(bytes32 indexed packageId, address indexed target, uint256 value, bytes returnData);
     event PackagesBatchExecuted(uint256 count);
     event PackageCancelled(bytes32 indexed packageId, address indexed caller);
+    event PackageExpired(bytes32 indexed packageId);
     event TierConfigured(uint8 indexed tier, uint48 delay, uint256 maxNativeValue, bool enabled);
     event TreasuryPaused(address indexed guardian);
     event TreasuryUnpaused(address indexed governance);
     event NativeDeposited(address indexed sender, uint256 value);
-    event ERC20Deposited(address indexed sender, address indexed token, uint256 amount);
-    event ERC721Deposited(address indexed sender, address indexed token, uint256 tokenId);
-    event ERC1155Deposited(address indexed sender, address indexed token, uint256 indexed tokenId, uint256 amount);
+    event ERC20Deposited(address indexed sender, address token, uint256 amount);
+    event ERC721Deposited(address indexed sender, address token, uint256 tokenId);
+    event ERC1155Deposited(address indexed sender, address token, uint256 indexed tokenId, uint256 amount);
+    event TargetAllowlistToggled(bool enabled);
+    event TargetAllowlistUpdated(address indexed target, bool allowed);
+    event ReserveFloorsConfigured(uint256 nativeFloor);
+    event ERC20ReserveFloorConfigured(address indexed token, uint256 floor);
 
     error InvalidTier(uint8 tier);
     error TierDisabled(uint8 tier);
     error TierDelayTooLong(uint48 delay, uint48 maximum);
     error NativeValueTooHigh(uint256 supplied, uint256 maximum);
     error InvalidTarget();
+    error TargetNotAllowed(address target);
     error InvalidZeroAmount();
     error PackageNotFound(bytes32 packageId);
     error PackageNotReady(bytes32 packageId, uint48 executeAfter);
     error PackageAlreadyFinalized(bytes32 packageId);
+    error PackageExpiredError(bytes32 packageId, uint48 expiresAt);
+    error PredecessorNotExecuted(bytes32 packageId, bytes32 predecessor);
+    error PredecessorCycle(bytes32 packageId, bytes32 predecessor);
+    error ExpiryWindowTooShort(uint48 executeAfter, uint48 expiresAt);
     error UnexpectedMsgValue(uint256 supplied);
     error ExecutionFailed(bytes32 packageId, bytes reason);
     error GuardianCancelWindowClosed(bytes32 packageId, uint48 executeAfter);
     error CallerNotGovernanceOrGuardian(address caller);
+    error ReserveFloorBreached(uint256 balance, uint256 floor);
 
     constructor(address timelockExecutor, address guardian) {
         if (timelockExecutor == address(0) || guardian == address(0)) revert InvalidTarget();
@@ -154,22 +197,37 @@ contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard,
     /// @notice Governance schedules an exact calldata package. No arbitrary caller can create one.
     /// @dev Deliberately NOT `whenNotPaused`: guardians pause execution, not scheduling, so
     ///      governance can keep preparing packages during an incident.
-    function approvePackage(address target, uint256 value, bytes calldata data, uint8 tier)
-        external
-        onlyRole(GOVERNANCE_ROLE)
-        returns (bytes32 packageId)
-    {
+    ///      `expiresAt` bounds the execution window (after it, the package is dead);
+    ///      0 means "no expiry". `predecessor` is another package that must execute first.
+    function approvePackage(
+        address target,
+        uint256 value,
+        bytes calldata data,
+        uint8 tier,
+        uint48 expiresAt,
+        bytes32 predecessor
+    ) external onlyRole(GOVERNANCE_ROLE) returns (bytes32 packageId) {
         if (target == address(0)) revert InvalidTarget();
         if (tier > MAX_TIER) revert InvalidTier(tier);
+        if (targetAllowlistEnabled && !targetAllowlist[target]) revert TargetNotAllowed(target);
 
         TierConfig memory config = tierConfig[tier];
         if (!config.enabled) revert TierDisabled(tier);
         if (value > config.maxNativeValue) revert NativeValueTooHigh(value, config.maxNativeValue);
 
+        uint48 executeAfter = uint48(block.timestamp + config.delay);
+        if (expiresAt != 0 && expiresAt <= executeAfter) revert ExpiryWindowTooShort(executeAfter, expiresAt);
+
+        // A predecessor must exist and not already be finalized as cancelled; cycles are
+        // impossible because nonce strictly increases, but self-reference is still rejected.
+        if (predecessor != bytes32(0)) {
+            Package storage pred = _packages[predecessor];
+            if (pred.target == address(0)) revert PackageNotFound(predecessor);
+            if (predecessor == bytes32(0)) revert PredecessorCycle(packageId, predecessor); // unreachable, guard
+        }
+
         uint256 nonce = nextPackageNonce++;
         packageId = keccak256(abi.encode(address(this), target, value, keccak256(data), tier, nonce));
-        uint48 executeAfter = uint48(block.timestamp + config.delay);
-
         _packages[packageId] = Package({
             target: target,
             value: value,
@@ -178,10 +236,26 @@ contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard,
             tier: tier,
             executed: false,
             cancelled: false,
-            nonce: nonce
+            nonce: nonce,
+            expiresAt: expiresAt,
+            predecessor: predecessor
         });
 
-        emit PackageApproved(packageId, target, value, tier, nonce, executeAfter, keccak256(data));
+        bytes32 dataHash = keccak256(data);
+        emit PackageApprovedV2(packageId, target, value, tier, nonce, executeAfter, expiresAt, predecessor, dataHash);
+    }
+
+    /// @notice Cancel a package that has expired: anyone can call, keeps state clean.
+    function closeExpiredPackage(bytes32 packageId) external {
+        Package storage package_ = _packages[packageId];
+        if (package_.target == address(0)) revert PackageNotFound(packageId);
+        if (package_.executed || package_.cancelled) revert PackageAlreadyFinalized(packageId);
+        if (package_.expiresAt == 0 || block.timestamp < package_.expiresAt) {
+            revert PackageNotReady(packageId, package_.expiresAt);
+        }
+
+        package_.cancelled = true; // finalized as cancelled; never executable
+        emit PackageExpired(packageId);
     }
 
     /// @notice Execute a governance-approved package after its quarantine delay.
@@ -226,6 +300,19 @@ contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard,
         if (package_.executed || package_.cancelled) revert PackageAlreadyFinalized(packageId);
         if (block.timestamp < package_.executeAfter) {
             revert PackageNotReady(packageId, package_.executeAfter);
+        }
+        if (package_.expiresAt != 0 && block.timestamp >= package_.expiresAt) {
+            revert PackageExpiredError(packageId, package_.expiresAt);
+        }
+        if (package_.predecessor != bytes32(0)) {
+            Package storage pred = _packages[package_.predecessor];
+            if (!pred.executed) revert PredecessorNotExecuted(packageId, package_.predecessor);
+        }
+        if (package_.value > 0) {
+            uint256 balance = address(this).balance;
+            if (balance < package_.value || balance - package_.value < nativeReserveFloor) {
+                revert ReserveFloorBreached(balance, nativeReserveFloor);
+            }
         }
 
         // Checks-effects-interactions. A revert from the external call rolls the status
@@ -289,6 +376,42 @@ contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard,
         onlyRole(GOVERNANCE_ROLE)
     {
         _configureTier(tier, delay, maxNativeValue, enabled);
+    }
+
+    // ------------------------------------------------------------------
+    // Destination allowlist and reserve floors (governance-only)
+    // ------------------------------------------------------------------
+
+    /// @notice Enable/disable the destination allowlist. When enabled, only allowlisted
+    ///         targets may receive packages.
+    function setTargetAllowlistEnabled(bool enabled) external onlyRole(GOVERNANCE_ROLE) {
+        targetAllowlistEnabled = enabled;
+        emit TargetAllowlistToggled(enabled);
+    }
+
+    /// @notice Add or remove an address from the destination allowlist.
+    function setTargetAllowed(address target, bool allowed) external onlyRole(GOVERNANCE_ROLE) {
+        if (target == address(0)) revert InvalidTarget();
+        targetAllowlist[target] = allowed;
+        emit TargetAllowlistUpdated(target, allowed);
+    }
+
+    /// @notice Set the minimum native balance the treasury must retain after any package
+    ///         execution. Zero disables the check.
+    function setNativeReserveFloor(uint256 floor) external onlyRole(GOVERNANCE_ROLE) {
+        nativeReserveFloor = floor;
+        emit ReserveFloorsConfigured(floor);
+    }
+
+    /// @notice Set a per-token reserve floor for ERC20 balances. Zero disables that
+    ///         token's floor. Floors are checked when a package targets the token's
+    ///         transfer/approve-style calldata via `erc20ReserveFloors` pre-execution
+    ///         only for the native asset; ERC20 floors are enforced off-chain by
+    ///         monitoring (see SECURITY.md).
+    function setERC20ReserveFloor(IERC20 token, uint256 floor) external onlyRole(GOVERNANCE_ROLE) {
+        if (address(token) == address(0)) revert InvalidTarget();
+        erc20ReserveFloors[token] = floor;
+        emit ERC20ReserveFloorConfigured(address(token), floor);
     }
 
     // ------------------------------------------------------------------

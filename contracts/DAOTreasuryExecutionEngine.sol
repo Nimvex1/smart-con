@@ -21,11 +21,39 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 ///      while it is still in quarantine (before its `executeAfter` timepoint). Once the
 ///      quarantine window has elapsed, cancellation is a governance-only decision, so a
 ///      compromised guardian cannot permanently suppress execution of approved packages.
+///
+///      Risk limits are deliberately NOT governance-exclusive. Every control that bounds
+///      the blast radius of a hostile governor -- the tier delay ladder, the per-tier
+///      native value caps, the destination allowlist and the native reserve floor -- is
+///      mutable by governance, so on its own it constrains nothing: a single governance
+///      batch could otherwise zero the delay, uncap the value, disable the allowlist and
+///      drain the treasury in one transaction. Two mechanisms fix that:
+///
+///      1. `minTierDelay` is `immutable`. No account, however many keys are compromised,
+///         can set a tier delay below it. This is the unconditional last line of defence.
+///      2. Loosening any risk limit (delay decrease within the floor, cap increase, tier
+///         enable, allowlist disable/removal, reserve floor decrease) requires
+///         `RISK_LIMITER_ROLE`. Tightening requires `GOVERNANCE_ROLE` and nothing else, so
+///         an incident can still be contained without waiting for the limiter. The two
+///         roles are deliberately NOT stacked: a single account holding both would be
+///         equivalent to the single-key design this replaces.
+///
+///      The limiter must be a key independent of the governor (a separate security
+///      council). Compromising it alone lets an attacker raise the caps and lift the
+///      allowlist, but not schedule anything -- governance is still required to approve a
+///      package, and `minTierDelay` still applies. Compromising governance alone lets an
+///      attacker tighten or schedule, but not remove a single risk limit. Both keys are
+///      required to dismantle the constraints, and even then the delay floor holds.
 contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard, ERC721Holder, ERC1155Holder {
     using SafeERC20 for IERC20;
 
     bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
     bytes32 public constant GUARDIAN_ROLE = keccak256("GUARDIAN_ROLE");
+
+    /// @notice Co-signature required to LOOSEN any risk limit. Deliberately a separate
+    ///         role from GOVERNANCE_ROLE so a captured governor cannot relax its own
+    ///         constraints. Holding this role grants no ability to schedule or execute.
+    bytes32 public constant RISK_LIMITER_ROLE = keccak256("RISK_LIMITER_ROLE");
 
     uint8 public constant TIER_LOW = 0;
     uint8 public constant TIER_MEDIUM = 1;
@@ -37,9 +65,15 @@ contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard,
     ///         nonsensical for this system and would risk `uint48` truncation abuse.
     uint48 public constant MAX_TIER_DELAY = 365 days;
 
-    /// @notice Maximum scheduling horizon: a package must be executable (executeAfter
-    ///         must be within this window after approval) so governance cannot park a
-    ///         package for a decade ahead.
+    /// @notice Lower bound for any tier delay, fixed at construction. This is the
+    ///         unconditional last line of defence: it is `immutable`, so no governance
+    ///         proposal and no co-signature can remove or shorten it. Only the deployer,
+    ///         once, at construction, chooses it -- and it must be non-zero.
+    uint48 public immutable minTierDelay;
+
+    /// @notice Maximum scheduling horizon: `expiresAt` must fall within this window of
+    ///         approval, so governance cannot park a live package for a decade ahead and
+    ///         fire it against a treasury whose governance has since changed.
     uint48 public constant MAX_PACKAGE_EXPIRY = 365 days;
 
     struct TierConfig {
@@ -75,21 +109,15 @@ contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard,
     bool public targetAllowlistEnabled;
     mapping(address allowed => bool isAllowed) public targetAllowlist;
 
-    /// @notice Optional per-asset reserve floors: the treasury refuses to execute a
-    ///         package that would push its native or ERC20 balance below the floor.
-    ///         ERC20 floors of 0 disable the check for that token.
+    /// @notice Optional per-asset reserve floor REFERENCES.
+    /// @dev NOT ENFORCED ON-CHAIN. The treasury executes arbitrary target calldata and
+    ///      cannot generically parse it to learn which tokens a call moves, so this
+    ///      mapping is a published value for off-chain monitoring only. Unlike
+    ///      `nativeReserveFloor`, no execution path ever reads it. A governance package
+    ///      calling `token.transfer(...)` on a target contract is entirely unaffected.
     uint256 public nativeReserveFloor;
-    mapping(IERC20 token => uint256 floor) public erc20ReserveFloors;
+    mapping(IERC20 token => uint256 floor) public erc20ReserveFloorReferences;
 
-    event PackageApproved(
-        bytes32 indexed packageId,
-        address indexed target,
-        uint256 value,
-        uint8 indexed tier,
-        uint256 nonce,
-        uint48 executeAfter,
-        bytes32 dataHash
-    );
     event PackageApprovedV2(
         bytes32 indexed packageId,
         address indexed target,
@@ -115,11 +143,14 @@ contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard,
     event TargetAllowlistToggled(bool enabled);
     event TargetAllowlistUpdated(address indexed target, bool allowed);
     event ReserveFloorsConfigured(uint256 nativeFloor);
-    event ERC20ReserveFloorConfigured(address indexed token, uint256 floor);
+    event ERC20ReserveFloorReferenceSet(address indexed token, uint256 floor);
 
     error InvalidTier(uint8 tier);
     error TierDisabled(uint8 tier);
     error TierDelayTooLong(uint48 delay, uint48 maximum);
+    error TierDelayTooShort(uint48 delay, uint48 minimum);
+    error RiskChangeRequiresLimiter(address caller);
+    error CallerNotGovernanceOrLimiter(address caller);
     error NativeValueTooHigh(uint256 supplied, uint256 maximum);
     error InvalidTarget();
     error TargetNotAllowed(address target);
@@ -128,17 +159,24 @@ contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard,
     error PackageNotReady(bytes32 packageId, uint48 executeAfter);
     error PackageAlreadyFinalized(bytes32 packageId);
     error PackageExpiredError(bytes32 packageId, uint48 expiresAt);
+    error PackageNotExpired(bytes32 packageId, uint48 expiresAt);
     error PredecessorNotExecuted(bytes32 packageId, bytes32 predecessor);
-    error PredecessorCycle(bytes32 packageId, bytes32 predecessor);
+    error PredecessorFinalized(bytes32 predecessor);
     error ExpiryWindowTooShort(uint48 executeAfter, uint48 expiresAt);
+    error ExpiryWindowTooLong(uint48 maximum, uint48 supplied);
     error UnexpectedMsgValue(uint256 supplied);
     error ExecutionFailed(bytes32 packageId, bytes reason);
     error GuardianCancelWindowClosed(bytes32 packageId, uint48 executeAfter);
     error CallerNotGovernanceOrGuardian(address caller);
     error ReserveFloorBreached(uint256 balance, uint256 floor);
 
-    constructor(address timelockExecutor, address guardian) {
-        if (timelockExecutor == address(0) || guardian == address(0)) revert InvalidTarget();
+    constructor(address timelockExecutor, address guardian, address riskLimiter, uint48 minTierDelay_) {
+        if (timelockExecutor == address(0) || guardian == address(0) || riskLimiter == address(0)) {
+            revert InvalidTarget();
+        }
+        if (minTierDelay_ == 0) revert TierDelayTooShort(minTierDelay_, 1);
+
+        minTierDelay = minTierDelay_;
 
         // Self-administered after construction: any subsequent role change must be done
         // through a governance-approved package targeting this contract.
@@ -147,13 +185,19 @@ contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard,
         // emergency admin root so role changes themselves are governance-mediated.
         _setRoleAdmin(GOVERNANCE_ROLE, GOVERNANCE_ROLE);
         _setRoleAdmin(GUARDIAN_ROLE, GOVERNANCE_ROLE);
+        // The limiter's own membership is governance-managed, but loosening a risk limit
+        // still needs the limiter to sign, so governance cannot appoint itself as one.
+        _setRoleAdmin(RISK_LIMITER_ROLE, GOVERNANCE_ROLE);
         _grantRole(GOVERNANCE_ROLE, timelockExecutor);
         _grantRole(GUARDIAN_ROLE, guardian);
+        _grantRole(RISK_LIMITER_ROLE, riskLimiter);
 
-        _configureTier(TIER_LOW, 1 days, 250 ether, true);
-        _configureTier(TIER_MEDIUM, 3 days, 100 ether, true);
-        _configureTier(TIER_HIGH, 7 days, 25 ether, true);
-        _configureTier(TIER_CRITICAL, 14 days, 5 ether, true);
+        // Shipped defaults are lifted to `minTierDelay` rather than reverting, so a DAO
+        // may choose a stricter floor than the defaults without re-deriving them.
+        _configureTier(TIER_LOW, _atLeastMin(1 days), 250 ether, true);
+        _configureTier(TIER_MEDIUM, _atLeastMin(3 days), 100 ether, true);
+        _configureTier(TIER_HIGH, _atLeastMin(7 days), 25 ether, true);
+        _configureTier(TIER_CRITICAL, _atLeastMin(14 days), 5 ether, true);
     }
 
     /// @notice Accepts direct native transfers and records them for off-chain accounting.
@@ -216,14 +260,22 @@ contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard,
         if (value > config.maxNativeValue) revert NativeValueTooHigh(value, config.maxNativeValue);
 
         uint48 executeAfter = uint48(block.timestamp + config.delay);
-        if (expiresAt != 0 && expiresAt <= executeAfter) revert ExpiryWindowTooShort(executeAfter, expiresAt);
+        if (expiresAt != 0) {
+            if (expiresAt <= executeAfter) revert ExpiryWindowTooShort(executeAfter, expiresAt);
+            uint48 horizon = uint48(block.timestamp + MAX_PACKAGE_EXPIRY);
+            if (expiresAt > horizon) revert ExpiryWindowTooLong(horizon, expiresAt);
+        }
 
-        // A predecessor must exist and not already be finalized as cancelled; cycles are
-        // impossible because nonce strictly increases, but self-reference is still rejected.
+        // A predecessor must exist and still be executable. Rejecting finalized
+        // predecessors is what stops a successor from being created that can never run:
+        // execution requires `pred.executed`, which a cancelled or already-executed
+        // package never satisfies. Cycles remain impossible because `predecessor` must
+        // already exist and nonces strictly increase, so a package can only reference
+        // an older one.
         if (predecessor != bytes32(0)) {
             Package storage pred = _packages[predecessor];
             if (pred.target == address(0)) revert PackageNotFound(predecessor);
-            if (predecessor == bytes32(0)) revert PredecessorCycle(packageId, predecessor); // unreachable, guard
+            if (pred.cancelled || pred.executed) revert PredecessorFinalized(predecessor);
         }
 
         uint256 nonce = nextPackageNonce++;
@@ -245,13 +297,21 @@ contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard,
         emit PackageApprovedV2(packageId, target, value, tier, nonce, executeAfter, expiresAt, predecessor, dataHash);
     }
 
-    /// @notice Cancel a package that has expired: anyone can call, keeps state clean.
+    /// @notice Finalize a package that can no longer run: anyone can call, keeps state clean.
+    /// @dev Two independent conditions qualify. Either the package's execution window has
+    ///      closed, or its predecessor was cancelled -- in which case the package can never
+    ///      execute (`_executePackage` requires `pred.executed`) and, when it has no
+    ///      `expiresAt`, no other permissionless path could ever finalize it. A merely
+    ///      *pending* predecessor does not qualify: that package may still run in order.
     function closeExpiredPackage(bytes32 packageId) external {
         Package storage package_ = _packages[packageId];
         if (package_.target == address(0)) revert PackageNotFound(packageId);
         if (package_.executed || package_.cancelled) revert PackageAlreadyFinalized(packageId);
-        if (package_.expiresAt == 0 || block.timestamp < package_.expiresAt) {
-            revert PackageNotReady(packageId, package_.expiresAt);
+
+        bool windowClosed = package_.expiresAt != 0 && block.timestamp >= package_.expiresAt;
+        bool predecessorCancelled = package_.predecessor != bytes32(0) && _packages[package_.predecessor].cancelled;
+        if (!windowClosed && !predecessorCancelled) {
+            revert PackageNotExpired(packageId, package_.expiresAt);
         }
 
         package_.cancelled = true; // finalized as cancelled; never executable
@@ -369,12 +429,17 @@ contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard,
         emit TreasuryUnpaused(msg.sender);
     }
 
-    /// @notice Reconfigure execution tiers. Governance-only so risk limits cannot be
-    ///         bypassed by guardians, and delays are capped at MAX_TIER_DELAY.
-    function configureTier(uint8 tier, uint48 delay, uint256 maxNativeValue, bool enabled)
-        external
-        onlyRole(GOVERNANCE_ROLE)
-    {
+    /// @notice Reconfigure execution tiers. Delays are bounded on both sides by the
+    ///         immutable `minTierDelay` and by `MAX_TIER_DELAY`.
+    /// @dev Authority is split so neither role can do both halves on its own:
+    ///      loosening (shorter delay, larger cap, re-enabling a disabled tier) requires
+    ///      RISK_LIMITER_ROLE; tightening requires GOVERNANCE_ROLE. Guardians and every
+    ///      other account are rejected outright.
+    function configureTier(uint8 tier, uint48 delay, uint256 maxNativeValue, bool enabled) external {
+        TierConfig memory current = tierConfig[tier];
+        _authorizeRiskChange(
+            delay < current.delay || maxNativeValue > current.maxNativeValue || (enabled && !current.enabled)
+        );
         _configureTier(tier, delay, maxNativeValue, enabled);
     }
 
@@ -384,34 +449,42 @@ contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard,
 
     /// @notice Enable/disable the destination allowlist. When enabled, only allowlisted
     ///         targets may receive packages.
-    function setTargetAllowlistEnabled(bool enabled) external onlyRole(GOVERNANCE_ROLE) {
+    /// @dev Disabling loosens containment and therefore requires RISK_LIMITER_ROLE;
+    ///      enabling it is a tightening and governance-only.
+    function setTargetAllowlistEnabled(bool enabled) external {
+        _authorizeRiskChange(!enabled && targetAllowlistEnabled);
         targetAllowlistEnabled = enabled;
         emit TargetAllowlistToggled(enabled);
     }
 
     /// @notice Add or remove an address from the destination allowlist.
-    function setTargetAllowed(address target, bool allowed) external onlyRole(GOVERNANCE_ROLE) {
+    /// @dev Removing a listed destination loosens containment and requires the limiter.
+    function setTargetAllowed(address target, bool allowed) external {
+        _authorizeRiskChange(!allowed && targetAllowlist[target]);
         if (target == address(0)) revert InvalidTarget();
         targetAllowlist[target] = allowed;
         emit TargetAllowlistUpdated(target, allowed);
     }
 
     /// @notice Set the minimum native balance the treasury must retain after any package
-    ///         execution. Zero disables the check.
-    function setNativeReserveFloor(uint256 floor) external onlyRole(GOVERNANCE_ROLE) {
+    ///         execution. Zero disables the check. This floor IS enforced on-chain, in
+    ///         `_executePackage`, for packages that forward native value.
+    /// @dev Lowering it loosens a risk limit and requires the risk limiter.
+    function setNativeReserveFloor(uint256 floor) external {
+        _authorizeRiskChange(floor < nativeReserveFloor);
         nativeReserveFloor = floor;
         emit ReserveFloorsConfigured(floor);
     }
 
-    /// @notice Set a per-token reserve floor for ERC20 balances. Zero disables that
-    ///         token's floor. Floors are checked when a package targets the token's
-    ///         transfer/approve-style calldata via `erc20ReserveFloors` pre-execution
-    ///         only for the native asset; ERC20 floors are enforced off-chain by
-    ///         monitoring (see SECURITY.md).
-    function setERC20ReserveFloor(IERC20 token, uint256 floor) external onlyRole(GOVERNANCE_ROLE) {
+    /// @notice Publish a per-token ERC20 balance floor REFERENCE for off-chain monitoring.
+    /// @dev NOT an on-chain control. The treasury executes arbitrary target calldata and
+    ///      cannot determine which tokens a given call moves, so nothing in the execution
+    ///      path reads this mapping. It exists so monitoring can compare observed balances
+    ///      against a published threshold. Do not treat it as a spend limit. See SECURITY.md.
+    function setERC20ReserveFloorReference(IERC20 token, uint256 floor) external onlyRole(GOVERNANCE_ROLE) {
         if (address(token) == address(0)) revert InvalidTarget();
-        erc20ReserveFloors[token] = floor;
-        emit ERC20ReserveFloorConfigured(address(token), floor);
+        erc20ReserveFloorReferences[token] = floor;
+        emit ERC20ReserveFloorReferenceSet(address(token), floor);
     }
 
     // ------------------------------------------------------------------
@@ -451,8 +524,27 @@ contract DAOTreasuryExecutionEngine is AccessControl, Pausable, ReentrancyGuard,
     function _configureTier(uint8 tier, uint48 delay, uint256 maxNativeValue, bool enabled) internal {
         if (tier > MAX_TIER) revert InvalidTier(tier);
         if (delay > MAX_TIER_DELAY) revert TierDelayTooLong(delay, MAX_TIER_DELAY);
+        // Unconditional: no caller, however many roles it holds, may go below the floor.
+        if (delay < minTierDelay) revert TierDelayTooShort(delay, minTierDelay);
         tierConfig[tier] = TierConfig({delay: delay, maxNativeValue: maxNativeValue, enabled: enabled});
         emit TierConfigured(tier, delay, maxNativeValue, enabled);
+    }
+
+    /// @dev Split authority for risk-limit reconfiguration. Loosening is reserved to
+    ///      RISK_LIMITER_ROLE, tightening to GOVERNANCE_ROLE. Because the roles are not
+    ///      stacked, no single compromised key can both schedule a package and remove the
+    ///      limits that package must respect. `minTierDelay` is enforced separately in
+    ///      `_configureTier` and is not reachable from either path.
+    function _authorizeRiskChange(bool loosening) private view {
+        if (loosening) {
+            if (!hasRole(RISK_LIMITER_ROLE, msg.sender)) revert RiskChangeRequiresLimiter(msg.sender);
+        } else if (!hasRole(GOVERNANCE_ROLE, msg.sender) && !hasRole(RISK_LIMITER_ROLE, msg.sender)) {
+            revert CallerNotGovernanceOrLimiter(msg.sender);
+        }
+    }
+
+    function _atLeastMin(uint48 delay) private view returns (uint48) {
+        return delay < minTierDelay ? minTierDelay : delay;
     }
 
     function supportsInterface(bytes4 interfaceId) public view override(AccessControl, ERC1155Holder) returns (bool) {

@@ -97,7 +97,7 @@ contract TreasuryInvariantTest is Test {
     address internal attacker = makeAddr("attacker");
 
     function setUp() public {
-        treasury = new DAOTreasuryExecutionEngine(governance, guardian);
+        treasury = new DAOTreasuryExecutionEngine(governance, guardian, governance, 1 days);
         target = new InvariantTarget();
         handler = new TreasuryHandler(treasury, target, governance, guardian);
 

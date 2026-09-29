@@ -133,11 +133,13 @@ contract EnterpriseDAO is Governor, GovernorSettings, GovernorCountingSimple, Go
     }
 
     /// @notice Governance-adjustable proposal threshold, clamped to immutable bounds.
-    /// @dev Re-applies `onlyGovernance` (Solidity overrides do not inherit parent modifiers),
-    ///      but deliberately routes to the internal `_setProposalThreshold` rather than
-    ///      `super.setProposalThreshold`: the parent public function carries its own
-    ///      `onlyGovernance` modifier, and running the whitelist deque check twice drains
-    ///      the deque and reverts during legitimate proposal execution.
+    /// @dev Re-applies `onlyGovernance` (Solidity overrides do not inherit parent modifiers)
+    ///      and routes to the internal `_setProposalThreshold` rather than
+    ///      `super.setProposalThreshold`. That is not a correctness requirement -- OZ 5.1's
+    ///      `GovernorSettings.setProposalThreshold` carries no whitelist or queue state, so
+    ///      the double-`onlyGovernance` route would be harmless. Keeping the direct internal
+    ///      call simply avoids a redundant role check; the clamp below is the only reason
+    ///      this override exists at all.
     function setProposalThreshold(uint256 newProposalThreshold) public override(GovernorSettings) onlyGovernance {
         if (newProposalThreshold < minimumProposalThreshold || newProposalThreshold > maximumProposalThreshold) {
             revert ProposalThresholdOutOfBounds(

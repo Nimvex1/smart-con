@@ -31,9 +31,11 @@ contract TreasuryFuzzTest is Test {
 
     uint8 internal constant MAX_TIER = 3;
     uint48 internal constant MAX_DELAY = 365 days;
+    /// @dev Mirrors the treasury's immutable floor; no tier may be configured below it.
+    uint48 internal constant MIN_DELAY = 1 days;
 
     function setUp() public {
-        treasury = new DAOTreasuryExecutionEngine(address(this), guardian);
+        treasury = new DAOTreasuryExecutionEngine(address(this), guardian, address(this), 1 days);
         target = new CallTarget();
     }
 
@@ -74,17 +76,23 @@ contract TreasuryFuzzTest is Test {
         assertTrue(treasury.packageExists(id));
     }
 
-    /// @dev Tier reconfiguration bounds: delays above MAX_TIER_DELAY always revert.
+    /// @dev Tier reconfiguration bounds: delays above MAX_TIER_DELAY always revert, and
+    ///      delays below the immutable minTierDelay always revert, for every value.
     function testFuzz_TierDelayBound(uint48 delay) public {
-        if (delay <= MAX_DELAY) {
+        if (delay < MIN_DELAY) {
+            vm.expectRevert(
+                abi.encodeWithSelector(DAOTreasuryExecutionEngine.TierDelayTooShort.selector, delay, MIN_DELAY)
+            );
             treasury.configureTier(0, delay, 1 ether, true);
-            (uint48 d,,) = treasury.tierConfig(0);
-            assertEq(d, delay);
-        } else {
+        } else if (delay > MAX_DELAY) {
             vm.expectRevert(
                 abi.encodeWithSelector(DAOTreasuryExecutionEngine.TierDelayTooLong.selector, delay, MAX_DELAY)
             );
             treasury.configureTier(0, delay, 1 ether, true);
+        } else {
+            treasury.configureTier(0, delay, 1 ether, true);
+            (uint48 d,,) = treasury.tierConfig(0);
+            assertEq(d, delay);
         }
     }
 
@@ -92,7 +100,7 @@ contract TreasuryFuzzTest is Test {
     ///      after that the revert must carry the exact executeAfter timepoint.
     function testFuzz_GuardianCancelTiming(uint8 tier, uint48 delay, uint256 elapsed) public {
         tier = uint8(bound(tier, 0, MAX_TIER));
-        delay = uint48(bound(delay, 1, 30 days));
+        delay = uint48(bound(delay, MIN_DELAY, 30 days));
         treasury.configureTier(tier, delay, type(uint256).max, true);
 
         bytes32 id = treasury.approvePackage(address(target), 0, "", tier, 0, bytes32(0));
@@ -119,7 +127,7 @@ contract TreasuryFuzzTest is Test {
     ///      expiresAt the package is dead and closeExpiredPackage finalizes it.
     function testFuzz_ExpiryWindow(uint8 tier, uint48 delay, uint48 extra, uint256 jump) public {
         tier = uint8(bound(tier, 0, MAX_TIER));
-        delay = uint48(bound(delay, 0, 30 days));
+        delay = uint48(bound(delay, MIN_DELAY, 30 days));
         extra = uint48(bound(extra, 1, 30 days));
         treasury.configureTier(tier, delay, type(uint256).max, true);
 
@@ -149,8 +157,8 @@ contract TreasuryFuzzTest is Test {
     /// @dev Predecessor ordering: a dependent package can only execute after its
     ///      predecessor, for arbitrary approval orders and delays.
     function testFuzz_PredecessorOrdering(uint48 d1, uint48 d2, bool executeFirstFirst) public {
-        d1 = uint48(bound(d1, 0, 30 days));
-        d2 = uint48(bound(d2, 0, 30 days));
+        d1 = uint48(bound(d1, MIN_DELAY, 30 days));
+        d2 = uint48(bound(d2, MIN_DELAY, 30 days));
         treasury.configureTier(0, d1, type(uint256).max, true);
         treasury.configureTier(1, d2, type(uint256).max, true);
 
@@ -177,7 +185,7 @@ contract TreasuryFuzzTest is Test {
     /// @dev Approving a dependency on an unknown package must revert.
     function testFuzz_PredecessorMustExist(uint8 tier, uint48 delay, bytes32 bogus) public {
         tier = uint8(bound(tier, 0, MAX_TIER));
-        delay = uint48(bound(delay, 0, 30 days));
+        delay = uint48(bound(delay, MIN_DELAY, 30 days));
         treasury.configureTier(tier, delay, type(uint256).max, true);
 
         vm.assume(bogus != bytes32(0));
@@ -212,12 +220,12 @@ contract TreasuryFuzzTest is Test {
         floor = bound(floor, 0, 1000 ether);
         spend = bound(spend, 1, 250 ether); // TIER_LOW cap
 
-        treasury.configureTier(0, 0, 250 ether, true);
+        treasury.configureTier(0, MIN_DELAY, 250 ether, true);
         treasury.setNativeReserveFloor(floor);
         deal(address(treasury), balance);
 
         bytes32 id = treasury.approvePackage(address(target), spend, "", 0, 0, bytes32(0));
-        vm.warp(block.timestamp + 1);
+        vm.warp(block.timestamp + MIN_DELAY + 1);
 
         if (balance >= spend && balance - spend >= floor) {
             treasury.executePackage(id);

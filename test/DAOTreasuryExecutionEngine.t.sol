@@ -77,7 +77,7 @@ contract DAOTreasuryExecutionEngineTest is Test {
     address internal rando = makeAddr("rando");
 
     function setUp() public {
-        treasury = new DAOTreasuryExecutionEngine(address(this), guardian);
+        treasury = new DAOTreasuryExecutionEngine(address(this), guardian, address(this), 1 days);
         target = new CallTarget();
         revertingTarget = new RevertingTarget();
         mock20 = new MockERC20();
@@ -409,13 +409,18 @@ contract DAOTreasuryExecutionEngineTest is Test {
     }
 
     function test_TierReconfigureGovernanceOnly() public {
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                IAccessControl.AccessControlUnauthorizedAccount.selector, guardian, treasury.GOVERNANCE_ROLE()
-            )
-        );
+        // Loosening the tier is rejected on the limiter path...
+        vm.expectRevert(abi.encodeWithSelector(DAOTreasuryExecutionEngine.RiskChangeRequiresLimiter.selector, guardian));
         vm.prank(guardian);
         treasury.configureTier(TIER_LOW, 0, 1 ether, true);
+
+        // ...and tightening it is rejected on the plain authorization path. The guardian
+        // holds neither half of the split, so it can do neither.
+        vm.expectRevert(
+            abi.encodeWithSelector(DAOTreasuryExecutionEngine.CallerNotGovernanceOrLimiter.selector, guardian)
+        );
+        vm.prank(guardian);
+        treasury.configureTier(TIER_LOW, 90 days, 1 ether, true);
 
         vm.expectEmit(true, false, false, true, address(treasury));
         emit DAOTreasuryExecutionEngine.TierConfigured(TIER_LOW, 2 days, 10 ether, true);
@@ -437,5 +442,16 @@ contract DAOTreasuryExecutionEngineTest is Test {
             abi.encodeWithSelector(DAOTreasuryExecutionEngine.TierDelayTooLong.selector, 366 days, 365 days)
         );
         treasury.configureTier(TIER_LOW, 366 days, 1 ether, true);
+    }
+
+    /// @dev The immutable floor: this test contract is BOTH governance and limiter here,
+    ///      and still cannot shorten a tier below `minTierDelay`.
+    function test_TierDelayLowerBoundIsImmutable() public {
+        assertTrue(treasury.hasRole(treasury.RISK_LIMITER_ROLE(), address(this)));
+        vm.expectRevert(abi.encodeWithSelector(DAOTreasuryExecutionEngine.TierDelayTooShort.selector, 0, 1 days));
+        treasury.configureTier(TIER_LOW, 0, 1 ether, true);
+
+        (uint48 d,,) = treasury.tierConfig(TIER_LOW);
+        assertEq(d, 1 days);
     }
 }

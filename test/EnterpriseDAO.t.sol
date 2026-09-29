@@ -82,7 +82,7 @@ contract EnterpriseDAOTest is Test {
         openExecutors[0] = address(0); // permissionless timelock execution
         timelock = new TimelockController(1 days, noProposers, openExecutors, address(this));
 
-        treasury = new DAOTreasuryExecutionEngine(address(timelock), guardian);
+        treasury = new DAOTreasuryExecutionEngine(address(timelock), guardian, guardian, 1 days);
         governor = _deployGovernor(QUORUM_MIN_BPS, QUORUM_MAX_BPS, QUORUM_LOW, QUORUM_HIGH);
 
         timelock.grantRole(timelock.PROPOSER_ROLE(), address(governor));

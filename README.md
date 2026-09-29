@@ -11,7 +11,7 @@ quorum governor**, a **multi-tier quarantined treasury execution engine** with
 | --- | --- |
 | `contracts/DAOGovernanceToken.sol` | ERC20 + ERC20Permit + ERC20Votes + ERC20Burnable with historical checkpoints and compiler-safe overrides. Fixed supply, minted once at construction. |
 | `contracts/EnterpriseDAO.sol` | GovernorSettings + GovernorCountingSimple + GovernorVotes + GovernorTimelockControl with block-based settings, bounded variable proposal threshold, and a snapshot-safe **linear dynamic quorum**. Constructor takes a single `GovernorConfig` struct (stack-safe without `via_ir`). |
-| `contracts/DAOTreasuryExecutionEngine.sol` | Multi-tier quarantine execution engine, governance-only scheduling, **time-bound** guardian emergency cancellation/pause, permissionless post-delay execution (single + batch), ETH/ERC20/ERC721/ERC1155 custody, native-value caps, delay upper bound, **package expiry**, **predecessor dependencies**, **destination allowlist**, **native reserve floor**, and package hashing. |
+| `contracts/DAOTreasuryExecutionEngine.sol` | Multi-tier quarantine execution engine, governance-only scheduling, **time-bound** guardian emergency cancellation/pause, permissionless post-delay execution (single + batch), ETH/ERC20/ERC721/ERC1155 custody, native-value caps, **immutable delay floor** (`minTierDelay`), **split governance/risk-limiter authority** over risk limits, **package expiry horizon**, **predecessor dependencies**, **destination allowlist**, **native reserve floor**, and package hashing. |
 | `contracts/DAODeploymentNotes.sol` | Secure bootstrap and role hand-off sequence (checklist form). |
 | `script/Deploy.s.sol` | Executable bootstrap deployment following the notes. |
 | `test/*.t.sol` | Foundry test suites: unit, fuzz, invariant, malicious-token and governance-attack coverage (~90 tests). |
@@ -92,14 +92,17 @@ git -C lib/forge-std checkout v1.9.7
 ## Deploy
 
 ```bash
-export INITIAL_RECIPIENT=0x...   # multisig receiving the initial supply
-export GUARDIAN_ADDRESS=0x...    # emergency guardian multisig
+export INITIAL_RECIPIENT=0x...      # multisig receiving the initial supply
+export GUARDIAN_ADDRESS=0x...       # emergency guardian multisig
+export RISK_LIMITER_ADDRESS=0x...   # risk limiter — MUST be a different key than the guardian
 forge script script/Deploy.s.sol --rpc-url <url> --broadcast
 ```
 
 Optional `TOKEN_NAME`, `TOKEN_SYMBOL`, `INITIAL_SUPPLY`, `TIMELOCK_MIN_DELAY`,
-`GOV_VOTING_DELAY`, `GOV_VOTING_PERIOD`, `GOV_QUORUM_MIN_BPS`, `GOV_QUORUM_MAX_BPS`
-and `GOV_THRESHOLD` override the defaults (see the script header).
+`TREASURY_MIN_TIER_DELAY`, `GOV_VOTING_DELAY`, `GOV_VOTING_PERIOD`,
+`GOV_QUORUM_MIN_BPS`, `GOV_QUORUM_MAX_BPS` and `GOV_THRESHOLD` override the defaults
+(see the script header). The deploy script reverts if the risk limiter is also the
+guardian, or if either role ends up stacked on the timelock.
 
 **Final manual step (deliberately not automated):** after verifying roles, renounce the
 deployer's `DEFAULT_ADMIN_ROLE` on the timelock. From that moment governance is
@@ -191,7 +194,9 @@ identifier commits to the contract address, target, native value, calldata hash,
 and nonce. After the quarantine delay, anyone can execute a package (single or batch),
 reducing liveness risk from a dead executor.
 
-Default tiers (governance-reconfigurable within bounds; delays capped at 365 days):
+Default tiers. Delays are reconfigured by `RISK_LIMITER_ROLE` and are bounded on both
+sides: never above `MAX_TIER_DELAY` (365 days), never below the immutable
+`minTierDelay` set at construction.
 
 | Tier | Delay | Maximum native value |
 | --- | ---: | ---: |
@@ -199,6 +204,16 @@ Default tiers (governance-reconfigurable within bounds; delays capped at 365 day
 | Medium | 3 days | 100 ETH |
 | High | 7 days | 25 ETH |
 | Critical | 14 days | 5 ETH |
+
+**Risk limits are split across two keys, not held by one.** Governance (the timelock)
+schedules and executes, and may only *tighten* limits. `RISK_LIMITER_ROLE` may only
+*loosen* them: shorten a delay, raise a cap, disable the destination allowlist, remove a
+listed destination, or lower the native reserve floor. `minTierDelay` is `immutable` and
+no role can go below it. A captured governor can therefore schedule a package but
+cannot widen a single constraint it must respect — see `SECURITY.md` §6. The limiter
+cannot schedule, execute, pause or unpause, so compromising it alone moves no funds.
+Keep the two on independent multisigs with disjoint signers; the deploy script rejects
+a topology that stacks them.
 
 **Guardian powers are split and time-bound:**
 
@@ -217,11 +232,13 @@ exclusively through governance-approved packages.
 Recommended trust model:
 
 `Token holders -> Governor -> TimelockController -> TreasuryExecutionEngine`
+`TreasuryExecutionEngine <- Security council (RISK_LIMITER_ROLE, risk limits only)`
+`TreasuryExecutionEngine <- Guardian (GUARDIAN_ROLE, pause + pre-quarantine cancel)`
 
-Use a multisig/security council for the emergency guardian. Do not leave a deployer EOA
-as a permanent administrator. Role grants, timelock delay, governor parameters, tier
-caps, and pause/unpause powers should be reviewed independently before funding the
-system.
+Use a multisig/security council for the emergency guardian, and a **separate** one for
+the risk limiter. Do not leave a deployer EOA as a permanent administrator. Role grants,
+timelock delay, governor parameters, tier caps, and pause/unpause powers should be
+reviewed independently before funding the system.
 
 ## Testing
 

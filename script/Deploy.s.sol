@@ -18,12 +18,15 @@ import {DAOTreasuryExecutionEngine} from "../contracts/DAOTreasuryExecutionEngin
 ///         Required environment variables:
 ///         - INITIAL_RECIPIENT   address receiving the full initial token supply (multisig)
 ///         - GUARDIAN_ADDRESS   emergency guardian (recommend an audited multisig)
+///         - RISK_LIMITER_ADDRESS risk limiter (recommend a security council DISTINCT
+///                                from the governor and the guardian)
 ///
 ///         Optional environment variables (defaults shown):
 ///         - TOKEN_NAME            "Enterprise DAO Token"
 ///         - TOKEN_SYMBOL          "EDAO"
 ///         - INITIAL_SUPPLY        100_000_000e18
 ///         - TIMELOCK_MIN_DELAY    2 days
+///         - TREASURY_MIN_TIER_DELAY 1 days (immutable floor on every tier delay)
 ///         - GOV_VOTING_DELAY      7200    (blocks, ~1 day at 12s blocks)
 ///         - GOV_VOTING_PERIOD     30240   (blocks, ~3.5 days)
 ///         - GOV_QUORUM_MIN_BPS    400     (4%)
@@ -42,6 +45,8 @@ contract Deploy is Script {
         address initialRecipient;
         uint256 initialSupply;
         address guardian;
+        address riskLimiter;
+        uint48 minTierDelay;
         uint256 timelockMinDelay;
         uint48 votingDelay;
         uint32 votingPeriod;
@@ -70,7 +75,8 @@ contract Deploy is Script {
         // ------------------------------------------------------------------
         // 3. Treasury: timelock becomes GOVERNANCE_ROLE, guardian gets GUARDIAN_ROLE
         // ------------------------------------------------------------------
-        DAOTreasuryExecutionEngine treasury = new DAOTreasuryExecutionEngine(address(timelock), params.guardian);
+        DAOTreasuryExecutionEngine treasury =
+            new DAOTreasuryExecutionEngine(address(timelock), params.guardian, params.riskLimiter, params.minTierDelay);
         console2.log("DAOTreasuryExecutionEngine:", address(treasury));
 
         // ------------------------------------------------------------------
@@ -114,6 +120,19 @@ contract Deploy is Script {
         // --- Treasury <-> Timelock/Guardian ----------------------------------
         require(treasury.hasRole(treasury.GOVERNANCE_ROLE(), address(timelock)), "timelock not treasury governance");
         require(treasury.hasRole(treasury.GUARDIAN_ROLE(), params.guardian), "guardian not set on treasury");
+        require(treasury.hasRole(treasury.RISK_LIMITER_ROLE(), params.riskLimiter), "risk limiter not set on treasury");
+        // The limiter is the whole point of the risk-limit design. If one entity can
+        // both schedule packages and loosen their limits, a single compromise is enough
+        // and the delay ladder is decorative again.
+        require(
+            !treasury.hasRole(treasury.RISK_LIMITER_ROLE(), address(timelock)),
+            "timelock must NOT hold the risk limiter role"
+        );
+        require(
+            !treasury.hasRole(treasury.GOVERNANCE_ROLE(), params.riskLimiter),
+            "risk limiter must NOT hold the governance role"
+        );
+        require(params.riskLimiter != params.guardian, "risk limiter must differ from the guardian");
         require(
             !treasury.hasRole(treasury.GOVERNANCE_ROLE(), address(governor)),
             "governor must reach treasury only via the timelock"
@@ -145,8 +164,7 @@ contract Deploy is Script {
         // --- Treasury tiers ---------------------------------------------------
         (uint48 lowDelay, uint256 lowCap, bool lowEnabled) = treasury.tierConfig(treasury.TIER_LOW());
         require(lowEnabled, "TIER_LOW disabled");
-        require(lowDelay == 1 days, "TIER_LOW delay mismatch");
-        require(lowCap == 250 ether, "TIER_LOW cap mismatch");
+        assertMinTierDelay(treasury, params.minTierDelay);
 
         // ------------------------------------------------------------------
         // Post-deployment report
@@ -161,6 +179,16 @@ contract Deploy is Script {
         console2.log("--------------------------------------------------------");
         console2.log("Trust topology:");
         console2.log("  token holders -> governor -> timelock -> treasury");
+        console2.log("Risk limiter (independent key):", params.riskLimiter);
+        console2.log("Immutable min tier delay:", params.minTierDelay);
+    }
+
+    function assertMinTierDelay(DAOTreasuryExecutionEngine treasury, uint48 expected) internal view {
+        require(treasury.minTierDelay() == expected, "min tier delay mismatch");
+        for (uint8 tier = 0; tier <= treasury.MAX_TIER(); ++tier) {
+            (uint48 delay,,) = treasury.tierConfig(tier);
+            require(delay >= expected, "a shipped tier is below the immutable floor");
+        }
     }
 
     function _readParams() internal view returns (DeployParams memory params) {
@@ -169,6 +197,8 @@ contract Deploy is Script {
         params.initialRecipient = vm.envAddress("INITIAL_RECIPIENT");
         params.initialSupply = vm.envOr("INITIAL_SUPPLY", uint256(100_000_000e18));
         params.guardian = vm.envAddress("GUARDIAN_ADDRESS");
+        params.riskLimiter = vm.envAddress("RISK_LIMITER_ADDRESS");
+        params.minTierDelay = uint48(vm.envOr("TREASURY_MIN_TIER_DELAY", uint256(1 days)));
         params.timelockMinDelay = vm.envOr("TIMELOCK_MIN_DELAY", uint256(2 days));
         params.votingDelay = uint48(vm.envOr("GOV_VOTING_DELAY", uint256(7_200)));
         params.votingPeriod = uint32(vm.envOr("GOV_VOTING_PERIOD", uint256(30_240)));

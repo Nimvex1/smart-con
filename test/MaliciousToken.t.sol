@@ -149,7 +149,7 @@ contract MaliciousTokenTest is Test {
     address internal rando = makeAddr("rando");
 
     function setUp() public {
-        treasury = new DAOTreasuryExecutionEngine(address(this), guardian);
+        treasury = new DAOTreasuryExecutionEngine(address(this), guardian, address(this), 1 days);
     }
 
     function test_ReentrantDepositCannotDoubleCount() public {
